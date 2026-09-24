@@ -8,6 +8,7 @@
 ## Fixes
 - **Proxy Pools**: keep request headers intact through Vercel/Cloudflare/Deno relays (spreading a `Headers` instance yielded `{}`, dropping auth and content-type)
 - **Xiaomi MiMo login**: keep the session in the httpOnly cookie only, require dashboard auth on the proxy branch, and stop forwarding authorization headers upstream
+- **Qoder**: align COSY headers and inference body with qodercli 1.1.63 captures, including machine identity, stable session/request-set IDs, server model metadata, and system message shape
 
 # v0.5.85 (2026-09-22)
 

@@ -22,8 +22,7 @@
 
 import { qoderEncodeBody } from "../shared/qoder/encoding.js";
 import { buildCosyHeaders } from "../shared/qoder/cosy.js";
-import { v4 as uuidv4 } from "uuid";
-import { createHash } from "crypto";
+import { v4 as uuidv4, v5 as uuidv5 } from "uuid";
 
 import { BaseExecutor } from "./base.js";
 import { PROVIDERS } from "../config/providers.js";
@@ -31,6 +30,7 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { SSE_DONE } from "../utils/sseConstants.js";
 import { FETCH_CONNECT_TIMEOUT_MS, HTTP_STATUS } from "../config/runtimeConfig.js";
 import {
+  QODER_BUSINESS_VERSION,
   QODER_CHAT_SIG_PATH,
   QODER_CONTEXT_TIER_ENV,
   qoderInferenceBase,
@@ -43,28 +43,37 @@ import { rewriteQoderMessageAttachments } from "../shared/qoder/attachments.js";
 import { resolveQoderContextTier, applyQoderContextTier } from "../shared/qoder/contextTier.js";
 
 /**
- * Hoist role:"system" messages out of the messages array (Qoder rejects
- * system in messages) and flatten multipart content arrays — EXCEPT image
- * blocks, which are preserved (see normalizeContent).
+ * Hoist role:"system" messages into the Qoder `system` block and mirror that
+ * block as the first message. Flatten multipart user content arrays — EXCEPT
+ * image blocks, which are preserved (see normalizeContent).
  */
 function normalizeMessages(messages) {
   if (!Array.isArray(messages) || messages.length === 0) {
-    return { messages: [], systemText: "" };
+    return { messages: [], systemBlocks: [], systemText: "" };
   }
-  const systemParts = [];
+  const systemBlocks = [];
   const out = [];
   for (const msg of messages) {
-    if (!msg || typeof msg !== "object") continue;
     if (msg.role === "system") {
-      const text = extractText(msg.content);
-      if (text) systemParts.push(text);
+      const blocks = Array.isArray(msg.content)
+        ? msg.content
+            .filter((block) => block?.type === OPENAI_BLOCK.TEXT && typeof block.text === "string" && block.text)
+            .map((block) => ({ type: OPENAI_BLOCK.TEXT, text: block.text }))
+        : [];
+      if (blocks.length) {
+        systemBlocks.push(...blocks);
+      } else {
+        const text = extractText(msg.content);
+        if (text) systemBlocks.push({ type: OPENAI_BLOCK.TEXT, text });
+      }
       continue;
     }
     const cloned = { ...msg };
     cloned.content = normalizeContent(msg.content);
     out.push(cloned);
   }
-  return { messages: out, systemText: systemParts.join("\n\n") };
+  const systemText = systemBlocks.map((block) => block.text).join("\n\n");
+  return { messages: out, systemBlocks, systemText };
 }
 
 /**
@@ -166,39 +175,10 @@ function lastUserText(messages) {
   return "";
 }
 
-function stableHash(prefix, ...parts) {
-  const h = createHash("sha256");
-  h.update(prefix);
-  for (const p of parts) {
-    h.update("\0");
-    h.update(String(p ?? ""));
-  }
-  return h.digest("hex").slice(0, 16);
+function stableSessionId(userId) {
+  return uuidv5(`${userId}:qodercli`, uuidv5.URL);
 }
 
-function stableChatRecordId(model, messages, tools, maxTokens) {
-  const h = createHash("sha256");
-  h.update("qoder-record\0");
-  h.update(String(model));
-  for (const m of messages) {
-    if (!m || typeof m !== "object") continue;
-    if (m.role) { h.update("\0"); h.update(m.role); }
-    if (typeof m.content === "string" && m.content) {
-      h.update("\0"); h.update(m.content);
-    } else if (Array.isArray(m.content)) {
-      // Include image refs so the same prompt with a different image gets
-      // a distinct chat_record_id.
-      h.update("\0");
-      try { h.update(JSON.stringify(m.content)); } catch {}
-    }
-  }
-  if (tools) {
-    h.update("\0");
-    try { h.update(JSON.stringify(tools)); } catch {}
-  }
-  h.update(`\0mt=${maxTokens}`);
-  return h.digest("hex").slice(0, 16);
-}
 
 function truncate(s, n) {
   return s && s.length > n ? `${s.slice(0, n)}...` : s || "";
@@ -207,15 +187,13 @@ function truncate(s, n) {
 /**
  * Map the OpenAI-style request body into the exact shape Qoder expects.
  */
-async function buildQoderRequestBody({ model, body, credentials, log, proxyOptions, signal, uploadFn = null, region = "intl" }) {
+async function buildQoderRequestBody({ model, body, credentials, log, proxyOptions, signal, uploadFn = null, region = "intl", modelConfig: suppliedModelConfig = null }) {
   const qoderKey = String(model || "").replace(/^qoder\//, "");
 
   // Fetch model config from dynamic API instead of relying on static QODER_MODEL_MAP.
   // This allows support for new Qoder models (e.g., qmodel_latest) without code changes.
-  let modelConfig = await getQoderModelConfig(credentials, qoderKey, { log, proxyOptions, signal, region });
+  let modelConfig = suppliedModelConfig || await getQoderModelConfig(credentials, qoderKey, { log, proxyOptions, signal, region });
   if (!modelConfig) {
-    // Try a forced refresh once before giving up — the cache may simply
-    // not be populated yet on first ever call for this credential.
     const refreshed = await resolveQoderModels(credentials, { forceRefresh: true, log, proxyOptions, signal, region });
     const retried = refreshed?.rawConfigs.get(qoderKey);
     if (!retried) {
@@ -249,12 +227,12 @@ async function buildQoderRequestBody({ model, body, credentials, log, proxyOptio
     log?.warn?.("QODER", `attachment rewrite failed: ${err.message}`);
   }
 
-  const { messages, systemText } = normalizeMessages(incoming);
+  const { messages, systemBlocks, systemText } = normalizeMessages(incoming);
   const tools = body.tools;
   const isReasoning = !!modelConfig.is_reasoning;
   const maxOutputTokens = Number(modelConfig.max_output_tokens) || 0;
 
-  let maxTokens = 32_768;
+  let maxTokens = 32_000;
   if (maxOutputTokens > 0) maxTokens = maxOutputTokens;
   if (typeof body.max_tokens === "number" && body.max_tokens > 0 && body.max_tokens < maxTokens) {
     maxTokens = body.max_tokens;
@@ -265,8 +243,10 @@ async function buildQoderRequestBody({ model, body, credentials, log, proxyOptio
 
   const lastUser = lastUserText(messages);
   const psd = credentials.providerSpecificData || {};
-  const sessionId = stableHash("qoder-session", psd.userId, qoderKey);
-  const recordId = stableChatRecordId(qoderKey, messages, tools, maxTokens);
+  const requestId = uuidv4();
+  const sessionId = stableSessionId(psd.userId);
+  const recordId = requestId;
+  const requestSetId = requestId;
 
   // Context-window tier (200K/400K/1M): the IDE picks one from model_config.context_config;
   // qodercli-style requests default to the smallest. Escalate when the prompt no longer fits.
@@ -282,53 +262,72 @@ async function buildQoderRequestBody({ model, body, credentials, log, proxyOptio
     );
   }
 
+  const wireModelConfig = {
+    key: qoderKey,
+    display_name: modelConfig.display_name || qoderKey,
+    model: modelConfig.model || "",
+    format: modelConfig.format || "openai",
+    is_vl: !!modelConfig.is_vl,
+    is_reasoning: isReasoning,
+    api_key: modelConfig.api_key || "",
+    url: modelConfig.url || "",
+    source: modelConfig.source || "system",
+    max_input_tokens: Number(modelConfig.max_input_tokens) || 0,
+  };
+  const parameters = { max_tokens: maxTokens };
+  if (isReasoning) {
+    const requestedEffort = body.reasoning_effort;
+    parameters.reasoning_effort = requestedEffort || "medium";
+    parameters.enable_thinking = requestedEffort !== "none" && requestedEffort !== "off";
+  }
+  const qoderMessages = systemBlocks.length
+    ? [{ role: "system", content: systemBlocks }, ...messages]
+    : messages;
+
   const built = {
     qoderKey,
     payload: {
-      request_id: uuidv4(),
-      request_set_id: recordId,
+      request_id: requestId,
+      request_set_id: requestSetId,
       chat_record_id: recordId,
       session_id: sessionId,
       stream: true,
       chat_task: "FREE_INPUT",
-      is_reply: true,
-      is_retry: false,
-      source: 1,
-      version: "3",
-      session_type: "qodercli",
-      agent_id: "agent_common",
-      task_id: "common",
-      code_language: "",
-      chat_prompt: "",
-      image_urls: null,
-      aliyun_user_type: "",
-      system: systemText,
-      messages,
-      tools: Array.isArray(tools) ? tools : [],
-      parameters: { max_tokens: maxTokens },
       chat_context: {
-        chatPrompt: "",
-        imageUrls: null,
+        text: lastUser,
+        features: [],
         extra: {
           context: [],
           modelConfig: { key: qoderKey, is_reasoning: isReasoning },
           originalContent: lastUser,
         },
-        features: [],
-        text: lastUser,
+        chatPrompt: "",
+        imageUrls: null,
       },
-      model_config: modelConfig,
+      is_reply: true,
+      is_retry: false,
+      source: 1,
+      version: "3",
+      agent_id: "agent_common",
+      task_id: "common",
+      session_type: "qodercli",
+      aliyun_user_type: "",
+      model_config: wireModelConfig,
+      system: systemBlocks,
+      messages: qoderMessages,
+      tools: Array.isArray(tools) ? tools : [],
+      parameters,
       business: {
         product: "cli",
-        version: "1.0.0",
+        version: QODER_BUSINESS_VERSION,
         type: "agent",
-        stage: "start",
-        id: uuidv4(),
-        name: truncate(lastUser, 30),
+        id: requestSetId,
+        ...(lastUser ? { name: lastUser.slice(0, 10) } : {}),
         begin_at: Date.now(),
+        stage: "start",
       },
     },
-    modelConfig,
+    modelConfig: wireModelConfig,
   };
   if (tierChoice) applyQoderContextTier(built.payload, tierChoice.tier);
   return built;
@@ -657,7 +656,7 @@ export class QoderExecutor extends BaseExecutor {
     } catch (err) {
       const fakeResp = new Response(
         JSON.stringify({ error: { message: err.message } }),
-        { status: 400, headers: { "Content-Type": "application/json" } },
+        { status: err.isAuthError ? err.status : 400, headers: { "Content-Type": "application/json" } },
       );
       return { response: fakeResp, url, headers: {}, transformedBody: body };
     }
@@ -677,6 +676,9 @@ export class QoderExecutor extends BaseExecutor {
           name: credentials.displayName || "",
           email: credentials.email || "",
           machineId: psd.machineId || "",
+          machineToken: psd.machineToken || "",
+          machineType: psd.machineType || "",
+          machineOS: psd.machineOS || "",
         },
       );
     } catch (err) {

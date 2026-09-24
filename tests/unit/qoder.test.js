@@ -28,7 +28,18 @@ import {
   clearQoderUploadCache,
   buildMultipartFile,
 } from "../../open-sse/shared/qoder/attachments.js";
-import { qoderInferenceBase } from "../../open-sse/shared/qoder/constants.js";
+import {
+  qoderInferenceBase,
+  qoderModelListUrl,
+} from "../../open-sse/shared/qoder/constants.js";
+
+describe("QODER model catalog endpoint", () => {
+  it("requests the official encoded model-list response", () => {
+    expect(qoderModelListUrl("intl")).toBe(
+      "https://api3.qoder.sh/algo/api/v2/model/list?Encode=1",
+    );
+  });
+});
 
 // Convenience aliases — tests were originally written against module-level
 // helpers; the QoderService class wraps them so each test creates its own
@@ -175,53 +186,72 @@ describe("buildCosyHeaders", () => {
       "Cosy-Machineos",
       "Cosy-Clienttype",
       "Cosy-Clientip",
-      "Cosy-Bodyhash",
-      "Cosy-Bodylength",
-      "Cosy-Sigpath",
       "Cosy-Data-Policy",
-      "Login-Version",
-      "X-Request-Id",
+      "Cosy-Business-Product",
+      "Cosy-Business-Type",
     ];
     for (const key of required) {
       expect(headers[key], `missing header ${key}`).toBeDefined();
     }
   });
 
+  it("matches captured qodercli 1.1.63 identity and business headers", () => {
+    const headers = buildCosyHeaders(Buffer.alloc(0), QODER_MODEL_LIST_URL, creds);
+    const signed = JSON.parse(
+      Buffer.from(headers.Authorization.split(".")[1], "base64").toString("utf8"),
+    );
+    expect(headers["Cosy-Version"]).toBe("1.1.63");
+    expect(headers["Cosy-Business-Product"]).toBe("cli");
+    expect(headers["Cosy-Business-Type"]).toBe("agent");
+    expect(headers["Cosy-Scene"]).toBe("assistant");
+    expect(headers["Cosy-Clientip"]).toBe("fixed-machine-id");
+    expect(signed.ideVersion).toBe("");
+    expect(signed.cosyVersion).toBe("1.1.63");
+  });
+
   it("Authorization is a Bearer COSY token with payload+sig", () => {
     const headers = buildCosyHeaders(Buffer.alloc(0), QODER_MODEL_LIST_URL, creds);
     expect(headers.Authorization).toMatch(/^Bearer COSY\.[A-Za-z0-9+/=]+\.[a-f0-9]{32}$/);
   });
-
-  it("Cosy-Sigpath strips the leading /algo prefix", () => {
-    const headers = buildCosyHeaders(Buffer.alloc(0), QODER_MODEL_LIST_URL, creds);
-    expect(headers["Cosy-Sigpath"]).toBe("/api/v2/model/list");
-  });
-
-  it("Cosy-Sigpath also handles the encoded chat URL", () => {
-    const headers = buildCosyHeaders(Buffer.from("body", "utf8"), QODER_CHAT_URL_ENCODED, creds);
-    expect(headers["Cosy-Sigpath"]).toBe(
-      "/api/v2/service/pro/sse/agent_chat_generation",
-    );
-  });
-
-  it("Cosy-Bodyhash is the MD5 of the request body, Cosy-Bodylength is the length", () => {
-    const body = Buffer.from("hello qoder", "utf8");
-    const headers = buildCosyHeaders(body, QODER_MODEL_LIST_URL, creds);
-    const expectedHash = crypto.createHash("md5").update(body).digest("hex");
-    expect(headers["Cosy-Bodyhash"]).toBe(expectedHash);
-    expect(headers["Cosy-Bodylength"]).toBe(String(body.length));
-  });
-
-  it("empty body produces the canonical empty-MD5 hash", () => {
-    const headers = buildCosyHeaders(Buffer.alloc(0), QODER_MODEL_LIST_URL, creds);
-    expect(headers["Cosy-Bodyhash"]).toBe("d41d8cd98f00b204e9800998ecf8427e");
-    expect(headers["Cosy-Bodylength"]).toBe("0");
-  });
-
   it("Cosy-Machineid + Cosy-Machinetoken match the supplied machineId", () => {
     const headers = buildCosyHeaders(Buffer.alloc(0), QODER_MODEL_LIST_URL, creds);
     expect(headers["Cosy-Machineid"]).toBe("fixed-machine-id");
     expect(headers["Cosy-Machinetoken"]).toBe("fixed-machine-id");
+  });
+
+  it("uses qodercli 1.1.63 payload and signature shape", () => {
+    const body = Buffer.from("hello qoder", "utf8");
+    const headers = buildCosyHeaders(body, QODER_CHAT_URL_ENCODED, creds);
+    const [, payloadB64, signature] = headers.Authorization.split(".");
+    const signed = JSON.parse(Buffer.from(payloadB64, "base64").toString("utf8"));
+    const expected = crypto
+      .createHash("md5")
+      .update(
+        [payloadB64, headers["Cosy-Key"], headers["Cosy-Date"], body.toString("latin1"), "/api/v2/service/pro/sse/agent_chat_generation"].join("\n"),
+        "latin1",
+      )
+      .digest("hex");
+    expect(signature).toBe(expected);
+    expect(signed).toMatchObject({ version: "v1", cosyVersion: "1.1.63", ideVersion: "" });
+    expect(signed.info).toMatch(/^[A-Za-z0-9+/=]+$/);
+  });
+
+  it("uses one machine identity across client and machine fields", () => {
+    const headers = buildCosyHeaders(Buffer.alloc(0), QODER_MODEL_LIST_URL, {
+      ...creds,
+      machineToken: "fixed-machine-token",
+    });
+    expect(headers["Cosy-Machineid"]).toBe("fixed-machine-id");
+    expect(headers["Cosy-Machinetoken"]).toBe("fixed-machine-token");
+    expect(headers["Cosy-Clientip"]).toBe("fixed-machine-id");
+  });
+
+  it("does not expose removed body fingerprint headers", () => {
+    const headers = buildCosyHeaders(Buffer.from("body"), QODER_CHAT_URL_ENCODED, creds);
+    expect(headers).not.toHaveProperty("Cosy-Bodyhash");
+    expect(headers).not.toHaveProperty("Cosy-Bodylength");
+    expect(headers).not.toHaveProperty("Cosy-Sigpath");
+    expect(headers).not.toHaveProperty("X-Request-Id");
   });
 
   it("auto-generates a machineId when none is supplied", () => {
@@ -232,6 +262,18 @@ describe("buildCosyHeaders", () => {
     expect(headers["Cosy-Machineid"]).toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
     );
+  });
+  it("preserves distinct machine identity, type, and OS fields", () => {
+    const headers = buildCosyHeaders(Buffer.alloc(0), QODER_MODEL_LIST_URL, {
+      ...creds,
+      machineToken: "P1gAP-machine-token",
+      machineType: "467fe1511378b94223",
+      machineOS: "x86_64_linux",
+    });
+    expect(headers["Cosy-Machineid"]).toBe("fixed-machine-id");
+    expect(headers["Cosy-Machinetoken"]).toBe("P1gAP-machine-token");
+    expect(headers["Cosy-Machinetype"]).toBe("467fe1511378b94223");
+    expect(headers["Cosy-Machineos"]).toBe("x86_64_linux");
   });
 
   it("throws when userId is missing", () => {
@@ -249,21 +291,6 @@ describe("buildCosyHeaders", () => {
   it("Cosy-User reflects the supplied userId verbatim", () => {
     const headers = buildCosyHeaders(Buffer.alloc(0), QODER_MODEL_LIST_URL, creds);
     expect(headers["Cosy-User"]).toBe("test-user-id");
-  });
-
-  it("two calls with identical inputs differ only in fields that include fresh randomness", () => {
-    // The signature fingerprints a fresh AES key + UUID per call, so the
-    // signature, Cosy-Key, X-Request-Id, and Cosy-Date (1s resolution)
-    // can differ — but Cosy-User, Cosy-Bodyhash, Cosy-Bodylength,
-    // Cosy-Sigpath, and the machineId-derived headers must be stable.
-    const a = buildCosyHeaders(Buffer.from("payload", "utf8"), QODER_CHAT_URL_ENCODED, creds);
-    const b = buildCosyHeaders(Buffer.from("payload", "utf8"), QODER_CHAT_URL_ENCODED, creds);
-    expect(a["Cosy-User"]).toBe(b["Cosy-User"]);
-    expect(a["Cosy-Bodyhash"]).toBe(b["Cosy-Bodyhash"]);
-    expect(a["Cosy-Bodylength"]).toBe(b["Cosy-Bodylength"]);
-    expect(a["Cosy-Sigpath"]).toBe(b["Cosy-Sigpath"]);
-    expect(a["Cosy-Machineid"]).toBe(b["Cosy-Machineid"]);
-    expect(a["X-Request-Id"]).not.toBe(b["X-Request-Id"]);
   });
 });
 
@@ -452,6 +479,97 @@ describe("normalizeMessages", () => {
     expect(result.messages[0].content).toContain("see");
     expect(result.messages[0].content).toContain("big.pdf");
     expect(result.messages[0].content).not.toContain("AAA");
+  });
+});
+
+describe("buildQoderRequestBody", () => {
+  const credentials = {
+    accessToken: "dt-test-token",
+    providerSpecificData: { userId: "test-user", machineId: "test-machine" },
+  };
+
+  const modelConfig = {
+    key: "qfmodel",
+    display_name: "Qoder Frontier",
+    model: "qfmodel",
+    format: "openai",
+    is_vl: false,
+    is_reasoning: true,
+    api_key: "api_key",
+    url: "https://api2.qoder.sh/algo/api/v2/service/pro/sse/agent_chat_generation",
+    source: "system",
+    max_input_tokens: 180000,
+  };
+
+  it("emits captured qodercli 1.1.63 request shape", async () => {
+    const built = await qoderExecutorInternals.buildQoderRequestBody({
+      model: "qoder/qfmodel",
+      body: {
+        messages: [
+          { role: "system", content: "follow instructions" },
+          { role: "user", content: "hello" },
+        ],
+        reasoning_effort: "high",
+        max_tokens: 4096,
+      },
+      credentials,
+      modelConfig,
+    });
+    const payload = built.payload;
+    const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+    expect(payload.request_set_id).toBe(payload.request_id);
+    expect(payload.chat_record_id).toBe(payload.request_id);
+    expect(payload.business.id).toBe(payload.request_set_id);
+    expect(payload.session_id).toMatch(uuid);
+    expect(payload.system).toEqual([{ type: "text", text: "follow instructions" }]);
+    expect(payload.messages[0]).toEqual(payload.system[0] && {
+      role: "system",
+      content: payload.system,
+    });
+    expect(payload.model_config).toMatchObject({
+      key: "qfmodel",
+      format: "openai",
+      is_reasoning: true,
+      source: "system",
+      max_input_tokens: 180000,
+    });
+    expect(payload.model_config).not.toHaveProperty("context_config");
+    expect(payload.parameters).toEqual({
+      max_tokens: 4096,
+      reasoning_effort: "high",
+      enable_thinking: true,
+    });
+    expect(payload.business).toMatchObject({
+      product: "cli",
+      version: "1.1.63",
+      type: "agent",
+      id: payload.request_set_id,
+      name: "hello",
+    });
+  });
+
+  it("uses catalog reasoning defaults when caller omits effort", async () => {
+    const built = await qoderExecutorInternals.buildQoderRequestBody({
+      model: "qoder/qfmodel",
+      body: { messages: [{ role: "user", content: "hello" }] },
+      credentials,
+      modelConfig,
+    });
+    expect(built.payload.parameters).toMatchObject({
+      reasoning_effort: "medium",
+      enable_thinking: true,
+    });
+  });
+
+  it("limits business name to captured qodercli title length", async () => {
+    const built = await qoderExecutorInternals.buildQoderRequestBody({
+      model: "qoder/qfmodel",
+      body: { messages: [{ role: "user", content: "read git changes" }] },
+      credentials,
+      modelConfig,
+    });
+    expect(built.payload.business.name).toBe("read git c");
   });
 });
 

@@ -17,6 +17,7 @@ import crypto from "crypto";
 import { v4 as uuidv4 } from "uuid";
 
 import {
+  QODER_CLIENT_IP,
   QODER_CLIENT_TYPE,
   QODER_DATA_POLICY,
   QODER_IDE_VERSION,
@@ -25,13 +26,9 @@ import {
   QODER_MACHINE_TYPE,
   QODER_RSA_PUBLIC_KEY,
 } from "./constants.js";
-
-// AES-128 wants a 16-byte key. Match qodercli/Veria: take the first 16 chars
-// of a fresh UUID's canonical string (hyphens included). The key is fresh
-// per request so even though the IV reuses the key bytes, each request still
-// has a unique IV.
+// Match qodercli 1.1.63: use 16 hex characters without UUID hyphens.
 function generateAesKey() {
-  return uuidv4().slice(0, 16);
+  return uuidv4().replace(/-/g, "").slice(0, 16);
 }
 
 function pkcs7Pad(data, blockSize) {
@@ -148,8 +145,7 @@ export function buildCosyHeaders(body, requestUrl, creds) {
   const sig = md5Hex(Buffer.from(sigInput, "latin1"));
 
   const machineId = creds.machineId || generateMachineId();
-  const bodyHash = md5Hex(bodyBuf);
-  const bodyLength = String(bodyBuf.length);
+  const machineToken = creds.machineToken || machineId;
 
   return {
     Authorization: `Bearer COSY.${payloadB64}.${sig}`,
@@ -158,18 +154,15 @@ export function buildCosyHeaders(body, requestUrl, creds) {
     "Cosy-Date": timestamp,
     "Cosy-Version": QODER_IDE_VERSION,
     "Cosy-Machineid": machineId,
-    "Cosy-Machinetoken": machineId,
-    "Cosy-Machinetype": QODER_MACHINE_TYPE,
-    "Cosy-Machineos": QODER_MACHINE_OS,
+    "Cosy-Machinetoken": machineToken,
+    "Cosy-Machinetype": creds.machineType || QODER_MACHINE_TYPE,
+    "Cosy-Machineos": creds.machineOS || QODER_MACHINE_OS,
     "Cosy-Clienttype": QODER_CLIENT_TYPE,
-    "Cosy-Clientip": "127.0.0.1",
-    "Cosy-Bodyhash": bodyHash,
-    "Cosy-Bodylength": bodyLength,
-    "Cosy-Sigpath": sigPath,
+    "Cosy-Clientip": creds.machineId || creds.machineToken || QODER_CLIENT_IP,
+    "Cosy-Business-Product": "cli",
+    "Cosy-Business-Type": "agent",
+    "Cosy-Scene": "assistant",
     "Cosy-Data-Policy": QODER_DATA_POLICY,
-    "Cosy-Organization-Id": "",
-    "Cosy-Organization-Tags": "",
     "Login-Version": QODER_LOGIN_VERSION,
-    "X-Request-Id": uuidv4(),
   };
 }

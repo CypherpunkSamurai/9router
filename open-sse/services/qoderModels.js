@@ -96,7 +96,7 @@ async function exchangeJobToken(pat, proxyOptions = null, signal = null, region 
     const parsed = Date.parse(data.expires_at);
     if (!Number.isNaN(parsed)) expiresAt = parsed;
   } else if (typeof data.expires_in === "number" && data.expires_in > 0) {
-    expiresAt = Date.now() + data.expires_in;
+    expiresAt = Date.now() + data.expires_in * 1000;
   }
   return { jobToken: data.token, jobRefreshToken: data.refresh_token || "", expiresAt };
 }
@@ -192,6 +192,9 @@ function cosyCredsFromConnection(credentials) {
     name: credentials.displayName || "",
     email: credentials.email || "",
     machineId: psd.machineId || "",
+    machineToken: psd.machineToken || "",
+    machineType: psd.machineType || "",
+    machineOS: psd.machineOS || "",
   };
 }
 
@@ -205,9 +208,9 @@ async function fetchQoderCatalogRaw(credentials, signal, proxyOptions = null, re
   const creds = cosyCredsFromConnection(credentials);
   if (!creds.userId || !creds.authToken) return null;
 
-  // Intl job-token traffic is rejected by api3 ("Login expired" 403) — the
-  // official qodercli serves it from api2 instead; CN uses the single gateway.
-  const modelListUrl = `${qoderInferenceBase(credentials, region)}/algo/api/v2/model/list`;
+  // The official qodercli requests the plaintext model catalog with Encode=1.
+  // Job-token traffic still uses api2 for intl accounts.
+  const modelListUrl = `${qoderInferenceBase(credentials, region)}/algo/api/v2/model/list?Encode=1`;
 
   const headers = {
     Accept: "application/json",
@@ -246,14 +249,28 @@ async function fetchQoderCatalogRaw(credentials, signal, proxyOptions = null, re
     if (signal && abortListener) signal.removeEventListener("abort", abortListener);
   }
 
-  if (!response.ok) return null;
+  if (!response.ok) {
+    if (response.status === 401 || response.status === 403) {
+      const errText = await response.text().catch(() => "");
+      const err = new Error(`qoder authentication failed (${response.status}): ${errText.slice(0, 200)}`);
+      err.status = response.status;
+      err.isAuthError = true;
+      throw err;
+    }
+    return null;
+  }
 
   const body = await response.json().catch(() => null);
-  if (!body || !Array.isArray(body.chat)) return null;
+  const entries = Array.isArray(body?.assistant)
+    ? body.assistant
+    : Array.isArray(body?.chat)
+      ? body.chat
+      : null;
+  if (!entries) return null;
 
   const models = [];
   const rawConfigs = new Map();
-  for (const entry of body.chat) {
+  for (const entry of entries) {
     if (!entry || typeof entry !== "object") continue;
     const key = entry.key;
     if (!key) continue;
@@ -385,6 +402,5 @@ export function invalidateQoderCatalog(credentials) {
   catalogCache.delete(cacheKey(credentials));
 }
 
-export function clearQoderCatalog() {
-  catalogCache.clear();
-}
+
+export const __test__ = { fetchQoderCatalogRaw };
